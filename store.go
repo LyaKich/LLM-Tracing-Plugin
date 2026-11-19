@@ -371,6 +371,13 @@ type traceStore struct {
 	version     uint64
 	sessCache   *sessionIndex
 	sessVersion uint64
+	// roll holds the hourly totals (see rollups.go); rollupAge bounds them.
+	// coveredFrom is just after the start of the newest request dropped
+	// from the detailed history: ranges reaching further back than it use
+	// the hourly totals.
+	roll        *rollups
+	rollupAge   time.Duration
+	coveredFrom int64
 }
 
 func (s *traceStore) setModels(p *pricer, gap time.Duration) {
@@ -441,7 +448,8 @@ func (s *traceStore) costLocked(t *uiTrace) traceCost {
 }
 
 func newTraceStore() *traceStore {
-	return &traceStore{byID: map[traceID]*uiTrace{}, models: newPricer(nil, nil), sessionGap: 30 * time.Minute, now: time.Now}
+	return &traceStore{byID: map[traceID]*uiTrace{}, models: newPricer(nil, nil), sessionGap: 30 * time.Minute, now: time.Now,
+		roll: newRollups(), rollupAge: defaultRollupAge}
 }
 
 // configure sets the limits. A detail limit of 0 disables the store and
@@ -460,6 +468,7 @@ func (s *traceStore) configure(enabled bool, detailLimit, historyMax int, histor
 	if detailLimit == 0 {
 		s.buf, s.detailed = nil, 0
 		clear(s.byID)
+		s.roll, s.coveredFrom = newRollups(), 0
 	}
 	s.enforceLocked()
 	s.version++
@@ -478,6 +487,7 @@ func (s *traceStore) enforceLocked() {
 	if drop > 0 {
 		for _, t := range s.buf[:drop] {
 			delete(s.byID, t.tid)
+			s.coveredFrom = max(s.coveredFrom, t.start+1)
 		}
 		rest := s.buf[drop:]
 		if cap(s.buf) > 2*len(rest)+64 {
@@ -517,8 +527,11 @@ func (s *traceStore) add(t *uiTrace) {
 	t.hasSpans = true
 	s.mu.Lock()
 	s.pushLocked(t)
-	if s.persist != nil && s.byID[t.tid] == t {
-		s.persist(encodeTrace(t))
+	if s.byID[t.tid] == t {
+		s.roll.apply(s.contributionLocked(t), 1)
+		if s.persist != nil {
+			s.persist(encodeTrace(t))
+		}
 	}
 	s.mu.Unlock()
 }
@@ -529,8 +542,11 @@ func (s *traceStore) addLateAttempt(tid traceID, span *otlpSpan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t := s.byID[tid]; t != nil {
+		before := s.contributionLocked(t)
 		t.addAttempt(toUISpan(span))
 		s.freezeLocked(t)
+		s.roll.apply(before, -1)
+		s.roll.apply(s.contributionLocked(t), 1)
 		s.version++
 		if s.persist != nil {
 			s.persist(encodeTrace(t))
@@ -546,8 +562,10 @@ func (s *traceStore) setPersist(fn func(line []byte)) {
 }
 
 // importHistory merges traces loaded from disk (any order). Traces already
-// in memory win. Only the newest detailLimit traces keep spans.
-func (s *traceStore) importHistory(loaded []*uiTrace) int {
+// in memory win. Only the newest detailLimit traces keep spans. With seed,
+// the imported traces are also added to the hourly totals (first start
+// without a saved rollup file).
+func (s *traceStore) importHistory(loaded []*uiTrace, seed bool) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.detailLimit <= 0 || len(loaded) == 0 {
@@ -576,6 +594,9 @@ func (s *traceStore) importHistory(loaded []*uiTrace) int {
 		// save them again so the price stays fixed from here on.
 		if s.freezeLocked(t) && s.persist != nil {
 			s.persist(encodeTrace(t))
+		}
+		if seed {
+			s.roll.apply(s.contributionLocked(t), 1)
 		}
 	}
 	s.enforceLocked()
@@ -955,6 +976,13 @@ type summaryStats struct {
 	OldestTraceAt string `json:"oldest_trace_at"`
 	NewestTraceAt string `json:"newest_trace_at"`
 	StoredTraces  int    `json:"stored_traces"`
+	// Source is "requests" when the range is covered by the stored request
+	// history (exact, including p95), or "hourly" when it reaches further
+	// back and the hourly totals answer (p95 approximate).
+	Source      string `json:"source"`
+	P95Approx   bool   `json:"p95_approximate"`
+	DetailSince string `json:"detail_since"`
+	HourlyHours int    `json:"hourly_hours"`
 	// DetailTraces is ui_max_traces: the newest requests that keep spans.
 	DetailTraces int `json:"detail_traces"`
 	Capacity     int `json:"capacity"`
@@ -978,11 +1006,13 @@ func (s *traceStore) summaryFor(now time.Time, window time.Duration) summaryStat
 	}
 	out := summaryStats{StoredTraces: len(s.buf), DetailTraces: s.detailLimit, Capacity: s.historyMax, Providers: []string{}, UnpricedModels: []string{}, PricesAsOf: pricesAsOfText(), PriceTable: priceTableInfo()}
 	var oldest, newest int64
+	oldestAll := int64(math.MaxInt64) // oldest stored request, any range
 	unpriced := map[string]bool{}
 	durations := make([]float64, 0, len(s.buf))
 	var total float64
 	providers := map[string]bool{}
 	for _, t := range s.buf {
+		oldestAll = min(oldestAll, t.start)
 		if t.provider != "" && !providers[t.provider] && len(providers) < maxSummaryProviders {
 			providers[t.provider] = true
 			out.Providers = append(out.Providers, t.provider)
@@ -1034,6 +1064,14 @@ func (s *traceStore) summaryFor(now time.Time, window time.Duration) summaryStat
 	out.CostMinUSD = roundUSD(out.CostMinUSD)
 	out.PricesAgeDays = pricesAgeDays(now)
 	out.PricesStale = out.PricesAgeDays > pricesStaleDays
+	out.Source, out.HourlyHours = "requests", len(s.roll.hours)
+	if len(s.buf) > 0 {
+		out.DetailSince = time.Unix(0, oldestAll).UTC().Format(time.RFC3339Nano)
+	}
+	if s.needsHourlyLocked(cutoff, oldestAll) {
+		s.fillFromHourlyLocked(&out, cutoff)
+		return out
+	}
 	if oldest > 0 {
 		out.OldestTraceAt = time.Unix(0, oldest).UTC().Format(time.RFC3339Nano)
 		out.NewestTraceAt = time.Unix(0, newest).UTC().Format(time.RFC3339Nano)
@@ -1056,4 +1094,95 @@ func percentile(values []float64, p float64) float64 {
 	sort.Float64s(values)
 	rank := int(math.Ceil(p*float64(len(values)))) - 1
 	return values[min(max(rank, 0), len(values)-1)]
+}
+
+// needsHourlyLocked reports whether requests that started at or after cutoff
+// are missing from the detailed history: some were dropped (cap or age), or
+// the hourly totals know older requests than the history holds.
+// oldestTrace is the earliest start in the history (MaxInt64 when empty);
+// the history is in insertion order, not strictly by start.
+func (s *traceStore) needsHourlyLocked(cutoff, oldestTrace int64) bool {
+	if len(s.roll.hours) == 0 {
+		return false
+	}
+	if cutoff < s.coveredFrom {
+		return true
+	}
+	if cutoff >= oldestTrace {
+		return false
+	}
+	for _, b := range s.roll.hours {
+		if b.First != 0 && b.First < oldestTrace && b.Last >= cutoff {
+			return true
+		}
+	}
+	return false
+}
+
+// fillFromHourlyLocked answers the summary totals from the hourly buckets.
+// Providers and unpriced models still come from the stored requests.
+func (s *traceStore) fillFromHourlyLocked(out *summaryStats, cutoff int64) {
+	since := cutoff
+	if since == math.MinInt64 {
+		since = 0
+	}
+	b, first, last := s.roll.sumSince(since)
+	out.Source, out.P95Approx = "hourly", true
+	out.Requests, out.Errors, out.Canceled = int(b.Requests), int(b.Errors), int(b.Canceled)
+	out.RetriedRequests, out.UnknownCostRequests, out.UnpricedRequests = int(b.Retried), int(b.UnknownCost), int(b.Unpriced)
+	out.InputTokens, out.TotalInputTokens, out.CacheReadTokens = b.Input, b.TotalInput, b.CacheRead
+	out.CacheCreationTokens, out.OutputTokens = b.CacheWrite, b.Output
+	out.CostUSD, out.CostMinUSD, out.NoCacheCostUSD = roundUSD(b.Cost), roundUSD(b.CostMin), roundUSD(b.NoCache)
+	out.CacheSavingsUSD = roundUSD(b.NoCache - b.Cost)
+	out.CacheHitRate = cacheHitRate(b.CacheRead, b.TotalInput)
+	out.OldestTraceAt, out.NewestTraceAt = "", ""
+	if first > 0 {
+		out.OldestTraceAt = time.Unix(0, first).UTC().Format(time.RFC3339Nano)
+		out.NewestTraceAt = time.Unix(0, last).UTC().Format(time.RFC3339Nano)
+	}
+	out.ErrorRate, out.AvgLatencyMS, out.P95LatencyMS = 0, 0, 0
+	if b.Requests > 0 {
+		out.ErrorRate = math.Round(float64(b.Errors)/float64(b.Requests)*1e4) / 1e4
+		out.AvgLatencyMS = math.Round(b.DurMS/float64(b.Requests)*1e3) / 1e3
+		out.P95LatencyMS = approxP95(b.Hist, b.Requests)
+	}
+}
+
+// setRollupAge bounds the hourly totals.
+func (s *traceStore) setRollupAge(age time.Duration) {
+	s.mu.Lock()
+	s.rollupAge = age
+	s.mu.Unlock()
+}
+
+// rollupSnapshot prunes and encodes the hourly totals when they changed.
+func (s *traceStore) rollupSnapshot(now time.Time) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.roll.prune(now, s.rollupAge)
+	if !s.roll.dirty {
+		return nil, false
+	}
+	data, err := s.roll.encode()
+	if err != nil {
+		return nil, false
+	}
+	s.roll.dirty = false
+	return data, true
+}
+
+// markRollupsDirty asks for another save after a failed write.
+func (s *traceStore) markRollupsDirty() {
+	s.mu.Lock()
+	s.roll.dirty = true
+	s.mu.Unlock()
+}
+
+// mergeRollups adds hourly totals loaded from disk.
+func (s *traceStore) mergeRollups(loaded map[int64]*hourBucket) {
+	s.mu.Lock()
+	s.roll.merge(loaded)
+	s.roll.dirty = false
+	s.version++
+	s.mu.Unlock()
 }

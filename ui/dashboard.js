@@ -13,7 +13,7 @@
   const SESSION_LIMIT = 20;
   const INSIGHTS_MS = 30000;
   const RANGE_KEY = 'llm-tracing.range';
-  const RANGE_LABELS = { '15m': 'last 15 minutes', '1h': 'last hour', '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days', all: 'whole history' };
+  const RANGE_LABELS = { '15m': 'last 15 minutes', '1h': 'last hour', '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days', '30d': 'last 30 days', '90d': 'last 90 days', all: 'all time' };
 
   // The page is served at <prefix>/v0/resource/plugins/<id>/dashboard; the
   // API lives on the same origin under <prefix>/v0/management/.
@@ -365,9 +365,9 @@
 
   function historyText(s) {
     const h = s.history && typeof s.history === 'object' ? s.history : {};
-    const parts = [fmtInt(s.stored_traces) + ' request(s) in history'];
+    const parts = [fmtInt(s.stored_traces) + ' request(s) listed' + (str(s.detail_since) ? ' since ' + fmtTime(s.detail_since) : '')];
     if (h.enabled) {
-      parts.push(h.loading ? 'loading saved history...' : 'saved to disk for ' + fmtInt(h.days) + ' day(s)');
+      parts.push(h.loading ? 'loading saved history...' : 'saved in ' + str(h.dir));
       if (str(h.last_error)) parts.push('save error: ' + str(h.last_error));
     } else {
       parts.push('not saved to disk (save_history: false), lost on restart');
@@ -383,14 +383,21 @@
     const rangeLabel = RANGE_LABELS[str(s.range)] || RANGE_LABELS[currentRange()] || '';
     $('m-requests-hint').textContent = rangeLabel;
     const line = $('range-line');
+    const hourly = str(s.source) === 'hourly';
     if (num(s.requests) > 0 && str(s.oldest_trace_at)) {
-      line.textContent = 'Cards, sessions and requests below cover the ' + rangeLabel.replace(/^all/, 'requests') + ': ' +
-        fmtInt(s.requests) + ' request(s) from ' + fmtTime(s.oldest_trace_at) + ' to ' + fmtTime(s.newest_trace_at) + '.';
+      line.textContent = 'Cards cover the ' + rangeLabel + ': ' + fmtInt(s.requests) + ' request(s) from ' +
+        fmtTime(s.oldest_trace_at) + ' to ' + fmtTime(s.newest_trace_at) +
+        (hourly ? ' (from hourly totals). Sessions, insights and the request list go back to ' + fmtTime(s.detail_since) +
+          ' (history_days / history_max_requests).' : '.');
     } else if (num(s.stored_traces) > 0) {
-      line.textContent = 'No requests in the ' + rangeLabel + '. ' + fmtInt(s.stored_traces) + ' older request(s) are kept - choose a longer time range.';
+      line.textContent = 'No requests in the ' + rangeLabel + '. Choose a longer time range.';
     } else {
       line.textContent = '';
     }
+    const h = s.history && typeof s.history === 'object' ? s.history : {};
+    const warn = $('history-warning');
+    warn.textContent = str(h.warning);
+    warn.hidden = !str(h.warning);
     const cost = $('m-cost');
     // One headline number (the upper estimate); details go in the hint line.
     cost.textContent = num(s.requests) === 0 ? '-' : fmtUSD(s.cost_usd);
@@ -422,7 +429,8 @@
       (num(s.unknown_cost_requests) > 0 ? ' ' + fmtInt(s.unknown_cost_requests) + ' canceled request(s) have unknown cost and are not included.' : '');
     $('m-errors').textContent = fmtPercent(s.error_rate);
     $('m-errors-hint').textContent = fmtInt(s.errors) + ' failed' + (num(s.canceled) > 0 ? ' · ' + fmtInt(s.canceled) + ' canceled (not counted)' : '');
-    $('m-latency').textContent = fmtDuration(s.avg_latency_ms) + ' / ' + fmtDuration(s.p95_latency_ms);
+    $('m-latency').textContent = fmtDuration(s.avg_latency_ms) + ' / ' + (s.p95_approximate ? '≈' : '') + fmtDuration(s.p95_latency_ms);
+    $('m-latency').title = s.p95_approximate ? 'p95 is approximate for ranges answered from hourly totals.' : '';
     $('m-tokens').textContent = fmtCompact(s.total_input_tokens) + ' / ' + fmtCompact(s.output_tokens);
     $('m-tokens').title = inputBreakdown(s) + '; ' + fmtInt(s.output_tokens) + ' output tokens';
     $('m-cache').textContent = num(s.total_input_tokens) > 0 ? fmtPercent(s.cache_hit_rate) : '-';

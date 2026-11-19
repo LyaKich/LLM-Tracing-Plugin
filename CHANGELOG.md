@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+### Fixed
+
+- **Cost totals no longer drop when old requests leave the history.** "All history" really meant the last `history_days` (7) days, capped at `history_max_requests` (20,000): when a busy day aged out, or a busy proxy hit the cap, the total fell (for example from $2,000 to $600) and looked like lost data. Totals now come from **hourly totals** kept for `rollup_days` (default 400): one small record per hour (about 250 bytes in memory, a few MB per year on disk at most), saved to `data_dir/rollups.json` at most once a minute and on shutdown. The first start of 0.5.0 rebuilds them from the saved history.
+- The oldest-request check no longer assumes the history is in start order (requests finish out of order).
+
+### Added
+
+- Time ranges **Last 30 days**, **Last 90 days** and **All time** (replaces "All history"). Short ranges inside the request history stay exact; longer ones are answered from the hourly totals, marked `source: "hourly"` on `/summary`, with an approximate p95 (shown as "≈").
+- The range line says what each part covers: cards cover the range, while sessions, insights and the request list go back to the oldest stored request (`detail_since`).
+- The status line shows the full history folder. A warning appears when it is likely to be lost: inside a container without a mounted volume, or in a temporary folder (`history.warning`).
+- Config key `rollup_days` (7..3650, default 400).
+
+### Changed
+
+- History files older than yesterday are compacted once a day: one line per request and no attempt details (only the newest `ui_max_traces` requests keep details in memory anyway). On a real 13,000-request history this took the folder from 41 MB to 3.3 MB.
+
 ## 0.4.1
 
 ### Changed

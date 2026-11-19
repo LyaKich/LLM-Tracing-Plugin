@@ -61,6 +61,7 @@ No key is required. With an empty `endpoint` the OTLP exporter is off and the pl
 | `ui_enabled` | `true` | Keep the request history for the built-in Traces page. |
 | `ui_max_traces` | `500` | Newest requests that keep full attempt details (waterfall, attributes), 10..5000. Older requests keep their totals. |
 | `history_days` | `7` | Days of history (1..90). Totals, cost, sessions and the time ranges use the whole history. |
+| `rollup_days` | `400` | Days of hourly totals (7..3650). Cost and token totals for every range, including All time, come from them once a range reaches past the request history. |
 | `history_max_requests` | `20000` | Most requests in the history (1000..200000); the oldest are dropped first. |
 | `save_history` | `true` | Save the history to `data_dir` so it survives proxy restarts and plugin updates. See [Saved history](#saved-history). |
 | `data_dir` | `plugins/llm-tracing` | Folder for the saved history, relative to the proxy's working directory. |
@@ -242,11 +243,23 @@ Memory: the history keeps every request of the last `history_days` (at most `his
 
 ### Saved history
 
+There are two levels of history:
+
+| Level | What it holds | Bounded by | Used for |
+|---|---|---|---|
+| Request history | every request with its tokens, cost, account and session | `history_days` (7) and `history_max_requests` (20,000) | the request list, sessions, insights, and the cards for ranges inside it |
+| Hourly totals | per hour: requests, errors, tokens, cost, latency histogram | `rollup_days` (400) | the cards for longer ranges and All time |
+
+So the All-time cost never drops when a busy day leaves the request history. The range line says when a range is answered from hourly totals, and the p95 is then approximate.
+
 With `save_history: true` (default) the history is written to `data_dir` (default `plugins/llm-tracing`, relative to the proxy's working directory) and loaded again in the background when the plugin starts, so a proxy restart or a plugin update does not reset the page. One JSON Lines file per UTC day, `traces-YYYYMMDD.jsonl`; files older than `history_days` are deleted. A request updated by a late usage record is written again, and the last line wins.
 
 - The files hold exactly what the page stores: masked client keys, redacted and truncated error text, models, providers, token counts, timings and auth indexes. Never prompts, responses, raw keys or account labels (labels are looked up when the page is viewed). Files are created with mode `0600` in a `0700` folder.
 - Writes never happen on the request path: requests are queued (at most 20,000) and written by the plugin's background loop about once a second, and on shutdown.
 - Damaged or hand-edited lines are skipped (`history.skipped_lines` in `/summary`). Write errors appear in `history.last_error` and in the page's status line.
+- Hourly totals are saved to `rollups.json` in the same folder (written atomically, at most once a minute and on shutdown; a crash can lose the last minute of totals). The first start of 0.5.0 rebuilds them from the saved request history.
+- Day files older than yesterday are compacted once a day (one line per request, no attempt details), about 5x smaller.
+- If the folder is likely to be lost (a container without a mounted volume, or a temporary folder), the page shows a warning with the path. In Docker, mount a volume at the proxy's `plugins/llm-tracing` folder or set `data_dir`.
 - `save_history: false` keeps the history in memory only.
 
 Wrong keys: CPA bans an IP for 30 minutes after 5 failed management-key attempts. The page stops auto-refresh after a 401 or 403 and asks for the key again instead of retrying.
@@ -266,7 +279,7 @@ The page uses four plugin Management API routes. The host authenticates them wit
 | `GET P/trace?id=<32 hex>` | `{"trace": item + "spans":[span...]}` |
 | `GET P/sessions?range=<r>&limit=50` | `{"sessions":[session...],"session_gap_seconds"}`, most recently active first |
 
-`range` is `15m`, `1h`, `6h`, `24h`, `7d` or `all`. `/summary` defaults to `1h` (as in 0.2.0) and returns `range`, `window_seconds` (0 for `all`), `cost_usd`, `cost_without_cache_usd`, `cache_savings_usd`, `unpriced_requests`, `unpriced_models`, `prices_as_of`, `oldest_trace_at` and `newest_trace_at` in addition to the fields above. `/traces` and `/sessions` default to `all`. Items also have `cost_usd`, `cost_without_cache_usd`, `priced`, `serving_model`, `context_tokens`, `context_window`, `context_used` (0..1), `session_id`, `session_seq` and `session_requests`; attempt spans have `cost_usd` when priced. A session has `id`, `client_key`, `model`, `serving_model`, `provider`, `account`, `requests`, `errors`, `started_at`, `last_at`, `active`, `first_context_tokens`, `context_tokens`, `peak_context_tokens`, `context_window`, `context_used`, `growth_per_request`, `requests_until_full` (-1 when unknown), token sums, `cache_hit_rate`, `cost_usd`, `cost_without_cache_usd` and `priced`. An unknown `range` or a malformed `session` gets 400.
+`range` is `15m`, `1h`, `6h`, `24h`, `7d`, `30d`, `90d` or `all`. `/summary` also returns `source` (`requests` or `hourly`), `p95_approximate`, `detail_since` and `hourly_hours`. `/summary` defaults to `1h` (as in 0.2.0) and returns `range`, `window_seconds` (0 for `all`), `cost_usd`, `cost_without_cache_usd`, `cache_savings_usd`, `unpriced_requests`, `unpriced_models`, `prices_as_of`, `oldest_trace_at` and `newest_trace_at` in addition to the fields above. `/traces` and `/sessions` default to `all`. Items also have `cost_usd`, `cost_without_cache_usd`, `priced`, `serving_model`, `context_tokens`, `context_window`, `context_used` (0..1), `session_id`, `session_seq` and `session_requests`; attempt spans have `cost_usd` when priced. A session has `id`, `client_key`, `model`, `serving_model`, `provider`, `account`, `requests`, `errors`, `started_at`, `last_at`, `active`, `first_context_tokens`, `context_tokens`, `peak_context_tokens`, `context_window`, `context_used`, `growth_per_request`, `requests_until_full` (-1 when unknown), token sums, `cache_hit_rate`, `cost_usd`, `cost_without_cache_usd` and `priced`. An unknown `range` or a malformed `session` gets 400.
 
 - **Summary** covers stored traces that started in the last hour (so at most `ui_max_traces`). `error_rate` is `errors / requests` (0 with no requests). `p95_latency_ms` uses the nearest-rank method. `retried_requests` counts traces with more than one attempt, whatever the outcome. Token fields sum the traces in the window (see [Token semantics](#token-semantics)); `cache_hit_rate` is computed from those sums. `providers` lists the serving providers of all stored traces (sorted, at most 50) for the provider filter. `account_labels` describes the label cache. `exporter.enabled` is false when no endpoint is set; `endpoint_host` is `host:port` only; `dropped_spans` sums queue-full, failed-export and backend-rejected spans; `last_error` is the redacted error of the last failed export and is cleared by the next successful one; `last_export_at` is the RFC 3339 time of the last successful export.
 - **Item:** `trace_id` (OTel trace ID), `cpa_trace_id`, `started_at` (RFC 3339 nano, UTC), `duration_ms`, `requested_model`, `source_format`, `stream`, `outcome` (`succeeded`, `failed`, `rejected`, `canceled`, `unknown`), `status_code`, `attempt_count`, `failed_attempts`, `input_tokens` (provider-reported), `total_input_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cache_hit_rate`, `output_tokens`, `reasoning_tokens`, `cached_tokens` (compatibility; per attempt the larger of cached and cache-read tokens), `provider` and `account` (of the serving attempt), `client_key` (`sha256:...`), `error` (the request error, or for a failed request without one the last failed attempt's error; empty for succeeded requests).

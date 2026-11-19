@@ -310,6 +310,8 @@ var timeRanges = map[string]time.Duration{
 	"6h":  6 * time.Hour,
 	"24h": 24 * time.Hour,
 	"7d":  7 * 24 * time.Hour,
+	"30d": 30 * 24 * time.Hour,
+	"90d": 90 * 24 * time.Hour,
 	"all": 0,
 }
 
@@ -320,7 +322,7 @@ func parseRange(q url.Values, fallback string) (time.Duration, string, string) {
 	}
 	window, ok := timeRanges[label]
 	if !ok {
-		return 0, "", "invalid range: expected 15m, 1h, 6h, 24h, 7d or all"
+		return 0, "", "invalid range: expected 15m, 1h, 6h, 24h, 7d, 30d, 90d or all"
 	}
 	return window, label, ""
 }

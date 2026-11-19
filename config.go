@@ -57,8 +57,10 @@ type config struct {
 	// restarts and plugin updates.
 	HistoryDays        int
 	HistoryMaxRequests int
-	SaveHistory        bool
-	DataDir            string
+	// RollupDays bounds the hourly totals (rollups.go).
+	RollupDays  int
+	SaveHistory bool
+	DataDir     string
 }
 
 // historyAge is the history window as a duration.
@@ -105,6 +107,7 @@ func defaultConfig() config {
 		SessionGap:          30 * time.Minute,
 		CacheWriteTTL:       cacheTTLAuto,
 		HistoryDays:         7,
+		RollupDays:          400,
 		HistoryMaxRequests:  20000,
 		SaveHistory:         true,
 		DataDir:             defaultDataDir,
@@ -176,6 +179,7 @@ func parseConfig(raw []byte) (config, []string, error) {
 	intField(values, "max_batch_spans", &cfg.MaxBatchSpans, 1, 10_000, warn)
 	intField(values, "ui_max_traces", &cfg.UIMaxTraces, minUITraces, maxUITraces, warn)
 	intField(values, "history_days", &cfg.HistoryDays, 1, 90, warn)
+	intField(values, "rollup_days", &cfg.RollupDays, 7, 3650, warn)
 	intField(values, "history_max_requests", &cfg.HistoryMaxRequests, 1000, 200_000, warn)
 	boolField(values, "save_history", &cfg.SaveHistory, warn)
 	if v, ok := values["data_dir"]; ok && v != nil {

@@ -34,7 +34,7 @@ func TestHistoryRoundTripSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := fresh.store.importHistory(loaded); n != 6 {
+	if n := fresh.store.importHistory(loaded, true); n != 6 {
 		t.Fatalf("imported %d", n)
 	}
 	after := fresh.summaryFor(0, "all")
@@ -64,7 +64,7 @@ func TestHistoryRoundTripSurvivesRestart(t *testing.T) {
 		t.Fatalf("old trace must keep totals without spans: %+v", old.traceItemJSON)
 	}
 	// Importing the same history again adds nothing.
-	if n := fresh.store.importHistory(loaded); n != 0 {
+	if n := fresh.store.importHistory(loaded, true); n != 0 {
 		t.Fatalf("duplicate import added %d", n)
 	}
 }

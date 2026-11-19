@@ -17,7 +17,7 @@ import (
 const (
 	pluginID      = "llm-tracing"
 	pluginName    = "LLM Tracing"
-	pluginVersion = "0.4.1"
+	pluginVersion = "0.5.0"
 	pluginAuthor  = "abdulmoiz65"
 	pluginRepo    = "https://github.com/abdulmoiz65/LLM-Tracing-Plugin"
 	// pluginLogo is shown by the Management Center's Plugins page and the
@@ -108,11 +108,21 @@ func (p *pluginState) syncHistoryLocked(cfg config) {
 	}
 	h := newHistoryFile(dir, cfg.HistoryDays, p.tracer.now)
 	h.loading = true
+	h.rollupSnap, h.rollupDirty = p.tracer.store.rollupSnapshot, p.tracer.store.markRollupsDirty
 	p.history = h
 	p.tracer.store.setPersist(h.enqueue)
 	go func() {
+		// Hourly totals first: without a saved file (first start of 0.5 or
+		// later), they are rebuilt from the loaded request history.
+		hours, foundRollups, errRollups := h.loadRollups()
+		if errRollups != nil {
+			h.setErr(fmt.Errorf("load hourly totals: %w", errRollups))
+		}
+		if foundRollups {
+			p.tracer.store.mergeRollups(hours)
+		}
 		traces, err := h.load()
-		n := p.tracer.store.importHistory(traces)
+		n := p.tracer.store.importHistory(traces, !foundRollups)
 		h.statMu.Lock()
 		h.loading, h.loaded, h.imported = false, len(traces), n
 		h.statMu.Unlock()
@@ -270,6 +280,7 @@ func configFields() []configField {
 		{"save_history", "boolean", d.SaveHistory, "Save the Traces page history to data_dir so it survives proxy restarts and plugin updates (same sanitized data as the page; no prompts, responses or keys)."},
 		{"data_dir", "string", d.DataDir, "Folder for the saved history, relative to the proxy's working directory. One file per day: traces-YYYYMMDD.jsonl."},
 		{"history_days", "integer", d.HistoryDays, "Days of history kept in memory and on disk (1..90). Older files are deleted."},
+		{"rollup_days", "integer", d.RollupDays, "Days of hourly totals kept (7..3650). Cost and token totals for any range, including All time, come from them, so they stay exact after older requests leave the request history."},
 		{"history_max_requests", "integer", d.HistoryMaxRequests, "Most requests kept in the history (1000..200000). Totals, cost and sessions use all of them; attempt details are kept for the newest ui_max_traces."},
 		{"session_gap_minutes", "integer", int(d.SessionGap / time.Minute), "Idle minutes after which a client's next request starts a new session on the Traces page (1..1440)."},
 	}

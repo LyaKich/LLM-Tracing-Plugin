@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +49,13 @@ type historyFile struct {
 	prunedDay string
 	days      int
 
+	// rollupSnap and rollupDirty connect the hourly totals of the store
+	// (saved to rollups.json at most once a minute and on close).
+	rollupSnap     func(time.Time) ([]byte, bool)
+	rollupDirty    func()
+	lastRollupSave time.Time
+	warning        string
+
 	statMu   sync.Mutex
 	lastErr  string
 	written  uint64
@@ -61,7 +69,26 @@ func newHistoryFile(dir string, days int, now func() time.Time) *historyFile {
 	if now == nil {
 		now = time.Now
 	}
-	return &historyFile{dir: dir, days: days, now: now}
+	return &historyFile{dir: dir, days: days, now: now, warning: dataDirWarning(dir, fileExists, os.Getenv, os.TempDir())}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// dataDirWarning explains when saved history is likely to be lost: inside a
+// container (unless the folder is on a mounted volume) or in a temp folder.
+func dataDirWarning(dir string, exists func(string) bool, getenv func(string) string, tempDir string) string {
+	if tempDir != "" {
+		if rel, err := filepath.Rel(tempDir, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "The history folder is inside the temporary folder (" + tempDir + "), which the system may clear. Set data_dir to a permanent folder."
+		}
+	}
+	if exists("/.dockerenv") || exists("/run/.containerenv") || getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return "The proxy runs in a container: put " + dir + " on a mounted volume, or the history is lost when the container is recreated."
+	}
+	return ""
 }
 
 // enqueue is the store's persist hook: it never blocks and never does I/O.
@@ -101,7 +128,11 @@ func (h *historyFile) flush() {
 		if err := h.pruneLocked(); err != nil {
 			h.setErr(err)
 		}
+		if err := h.compactLocked(); err != nil {
+			h.setErr(err)
+		}
 	}
+	h.saveRollupsLocked(false)
 	if len(lines) == 0 {
 		return
 	}
@@ -159,8 +190,119 @@ func (h *historyFile) closeLocked() {
 func (h *historyFile) close() {
 	h.flush()
 	h.ioMu.Lock()
+	h.saveRollupsLocked(true)
 	h.closeLocked()
 	h.ioMu.Unlock()
+}
+
+// saveRollupsLocked writes rollups.json when the totals changed, at most once
+// a minute unless forced.
+func (h *historyFile) saveRollupsLocked(force bool) {
+	if h.rollupSnap == nil {
+		return
+	}
+	now := h.now()
+	if !force && now.Sub(h.lastRollupSave) < rollupSaveEvery {
+		return
+	}
+	data, changed := h.rollupSnap(now)
+	if !changed {
+		return
+	}
+	if err := writeFileAtomic(filepath.Join(h.dir, rollupFile), data); err != nil {
+		h.setErr(fmt.Errorf("save hourly totals: %w", err))
+		if h.rollupDirty != nil {
+			h.rollupDirty()
+		}
+		return
+	}
+	h.lastRollupSave = now
+}
+
+// loadRollups reads rollups.json. found is false when there is no file yet.
+func (h *historyFile) loadRollups() (map[int64]*hourBucket, bool, error) {
+	raw, err := os.ReadFile(filepath.Join(h.dir, rollupFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	hours, skipped, err := decodeRollups(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	h.statMu.Lock()
+	h.skipped += skipped
+	h.statMu.Unlock()
+	return hours, true, nil
+}
+
+// compactLocked rewrites day files older than yesterday without attempt
+// spans and with one line per request (the last one). Only the newest
+// requests keep spans in memory anyway, so this only shrinks the files
+// (to about a fifth).
+func (h *historyFile) compactLocked() error {
+	names, err := historyFiles(h.dir)
+	if err != nil {
+		return err
+	}
+	yesterday := h.now().UTC().AddDate(0, 0, -1).Format("20060102")
+	var errs []error
+	for _, name := range names {
+		day := strings.TrimSuffix(strings.TrimPrefix(name, historyFilePrefix), historyFileSuffix)
+		if day >= yesterday {
+			continue
+		}
+		if errCompact := compactHistoryFile(filepath.Join(h.dir, name)); errCompact != nil {
+			errs = append(errs, errCompact)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func compactHistoryFile(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(raw, []byte(`"sp2":`)) && bytes.Count(raw, []byte("\n")) < 2 {
+		return nil
+	}
+	order := []string{}
+	last := map[string]histRecord{}
+	duplicates := false
+	hasSpans := false
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var r histRecord
+		if json.Unmarshal(line, &r) != nil || r.V != historyRecordV {
+			continue // decodeTrace would skip it too
+		}
+		if _, seen := last[r.TID]; seen {
+			duplicates = true
+		} else {
+			order = append(order, r.TID)
+		}
+		hasSpans = hasSpans || len(r.Spans) > 0
+		r.Spans = nil
+		last[r.TID] = r
+	}
+	if !duplicates && !hasSpans {
+		return nil
+	}
+	var out bytes.Buffer
+	for _, id := range order {
+		line, errMarshal := json.Marshal(last[id])
+		if errMarshal != nil {
+			return errMarshal
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	return writeFileAtomic(path, out.Bytes())
 }
 
 // historyFiles lists history files with their day, oldest first.
@@ -270,6 +412,8 @@ type historyStatus struct {
 	Written  uint64 `json:"written_records"`
 	Dropped  uint64 `json:"dropped_records"`
 	Error    string `json:"last_error"`
+	// Warning explains when the history folder is likely to be lost.
+	Warning string `json:"warning"`
 }
 
 func (h *historyFile) status() historyStatus {
@@ -281,7 +425,7 @@ func (h *historyFile) status() historyStatus {
 	h.mu.Unlock()
 	h.statMu.Lock()
 	defer h.statMu.Unlock()
-	return historyStatus{Enabled: true, Dir: h.dir, Days: h.days, Loading: h.loading, Loaded: h.loaded, Imported: h.imported,
+	return historyStatus{Enabled: true, Dir: h.dir, Days: h.days, Loading: h.loading, Loaded: h.loaded, Imported: h.imported, Warning: h.warning,
 		Skipped: h.skipped, Written: h.written, Dropped: dropped, Error: h.lastErr}
 }
 

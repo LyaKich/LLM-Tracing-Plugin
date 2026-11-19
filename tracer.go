@@ -129,6 +129,7 @@ func newTracer(cfg config, now func() time.Time) *tracer {
 	t.store.now = now
 	t.store.configure(cfg.uiActive(), cfg.UIMaxTraces, cfg.HistoryMaxRequests, cfg.historyAge())
 	t.store.setModels(cfg.pricer(), cfg.SessionGap)
+	t.store.setRollupAge(time.Duration(cfg.RollupDays) * 24 * time.Hour)
 	t.exp.configure(cfg)
 	return t
 }
@@ -162,6 +163,7 @@ func (t *tracer) reconfigure(cfg config) {
 	}
 	t.store.configure(cfg.uiActive(), cfg.UIMaxTraces, cfg.HistoryMaxRequests, cfg.historyAge())
 	t.store.setModels(cfg.pricer(), cfg.SessionGap)
+	t.store.setRollupAge(time.Duration(cfg.RollupDays) * 24 * time.Hour)
 	t.mu.Unlock()
 	t.exp.configure(cfg)
 }

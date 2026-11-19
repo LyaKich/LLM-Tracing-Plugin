@@ -38,7 +38,7 @@ func TestCostIsFrozenAtRecordTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh.store.importHistory(loaded)
+	fresh.store.importHistory(loaded, true)
 	items := fresh.store.list(traceFilter{limit: 10, status: "all"}, nil)
 	if len(items) != 3 {
 		t.Fatalf("items %d", len(items))

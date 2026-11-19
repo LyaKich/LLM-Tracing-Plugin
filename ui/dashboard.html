@@ -48,11 +48,15 @@
           <option value="6h">Last 6 hours</option>
           <option value="24h">Last 24 hours</option>
           <option value="7d">Last 7 days</option>
-          <option value="all" selected>All history</option>
+          <option value="30d">Last 30 days</option>
+          <option value="90d">Last 90 days</option>
+          <option value="all" selected>All time</option>
         </select>
       </label>
       <p id="range-line" class="muted small" aria-live="polite"></p>
     </div>
+
+    <p id="history-warning" class="alert" role="alert" hidden></p>
 
     <section class="summary" aria-label="Summary for the selected time range">
       <div class="metric"><span class="label">Requests</span><strong id="m-requests">-</strong><span id="m-requests-hint" class="hint"></span></div>
